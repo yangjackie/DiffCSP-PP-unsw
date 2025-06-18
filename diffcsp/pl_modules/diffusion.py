@@ -25,7 +25,7 @@ from diffcsp.common.data_utils import (
 from diffcsp.pl_modules.lattice.crystal_family import CrystalFamily
 from diffcsp.pl_modules.diff_utils import d_log_p_wrapped_normal
 
-MAX_ATOMIC_NUM=100
+MAX_ATOMIC_NUM = 100
 
 
 class BaseModule(pl.LightningModule):
@@ -52,6 +52,7 @@ class BaseModule(pl.LightningModule):
 
 class SinusoidalTimeEmbeddings(nn.Module):
     """ Attention is all you need. """
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -70,7 +71,8 @@ class CSPDiffusion(BaseModule):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        self.decoder = hydra.utils.instantiate(self.hparams.decoder, latent_dim = self.hparams.time_dim, _recursive_=False)
+        self.decoder = hydra.utils.instantiate(self.hparams.decoder, latent_dim=self.hparams.time_dim,
+                                               _recursive_=False)
         self.beta_scheduler = hydra.utils.instantiate(self.hparams.beta_scheduler)
         self.sigma_scheduler = hydra.utils.instantiate(self.hparams.sigma_scheduler)
         self.time_dim = self.hparams.time_dim
@@ -78,79 +80,126 @@ class CSPDiffusion(BaseModule):
 
         self.crystal_family = CrystalFamily()
 
-    def forward(self, batch, batch_idx = None):
-
+    def forward(self, batch, batch_idx=None):
+        """
+        Forward pass for the CSPDiffusion model. This is the default method that is required by the PyTorch Lightning framework when
+        training the model. It takes a batch of data and computes the loss for the diffusion process. Importantly, it allows the underlying
+        pytorch_lightning framework to handle the training loop, validation, and testing steps automatically, such as autodifferentiation.
+        """
 
         batch_size = batch.num_graphs
+
+        # note that this returns a list of time t, at which we will generate the noised samples. (avoiding the for loop)
         times = self.beta_scheduler.uniform_sample_t(batch_size, self.device)
+
+        # The purpose of SinusoidalTimeEmbeddingsis to convert a scalar time input into a higher-dimensional embedding
+        # using sinusoidal functions (sine and cosine). This type of embedding is inspired by the positional encodings
+        # used in Transformer models (as noted by the comment “Attention is all you need”).
+        # Specifically, the embedding allows the model to represent the time step (often used in diffusion models)
+        # in a way that captures temporal information, enabling the neural network to be aware of the current timestep
+        # during the diffusion process. The embedding alternates between sine and cosine functions at different frequencies,
+        # producing a rich, non-redundant representation of time that helps the model learn temporal dynamics effectively.
+        #
+        # the other way to think about this is to normalise the time step to a range of [0, 1] to ensure numerical stability.
         time_emb = self.time_embedding(times)
 
+        # This is from the noise scheduler, which will give alpha_t and beta_t for every time given in the tensor array 'times'.
+        # standard practice for DDPM.
         alphas_cumprod = self.beta_scheduler.alphas_cumprod[times]
         beta = self.beta_scheduler.betas[times]
 
         c0 = torch.sqrt(alphas_cumprod)
         c1 = torch.sqrt(1. - alphas_cumprod)
 
+        # sigma_t is the noise level at time t, which is used to scale the noise added to the input data.
         sigmas = self.sigma_scheduler.sigmas[times]
+        # This is needed for the fractional coordinates, that renormalised the noised to ensure it is drawn from
+        # the wrapped normal distribution.
         sigmas_norm = self.sigma_scheduler.sigmas_norm[times]
 
+        # convert the lattice parameters to a matrix representation of lattice vectors.
         lattices = lattice_params_to_matrix_torch(batch.lengths, batch.angles)
+        # de_so3 is a method that converts the lattice matrix to a SO(3) representation, which is a rotation-invariant representation.
         lattices = self.crystal_family.de_so3(lattices)
+
         frac_coords = batch.frac_coords
 
         rand_x = torch.randn_like(frac_coords)
 
+        # For each item i in the batch, repeat sigmas[i] exactly batch.num_atoms[i] times.
         sigmas_per_atom = sigmas.repeat_interleave(batch.num_atoms)[:, None]
         sigmas_norm_per_atom = sigmas_norm.repeat_interleave(batch.num_atoms)[:, None]
 
-        
+        # These lines use symmetry operations to canonicalize anchor coordinates, then generate all symmetrically-equivalent coordinates in the crystal.
+        # Common in:
+        # Crystallographic and materials generation code, where symmetry is used to expand a small set of reference sites (anchors) into the full
+        # set of atomic positions in the unit cell or supercell.
+        # This gathers the coordinates (or features) of certain "anchor" atoms/sites, typically those that serve as symmetry references in crystallography.
         rand_x_anchor = rand_x[batch.anchor_index]
+        # This transforms the anchor coordinates using the inverse of the operations (ops_inv) defined in the batch.
+        # Applies the inverse symmetry operation to bring the anchor coordinates into a "canonical" or reference frame,
+        # standardizing their positions for symmetry-related processing.
         rand_x_anchor = (batch.ops_inv[batch.anchor_index] @ rand_x_anchor.unsqueeze(-1)).squeeze(-1)
+        # This step propagates the canonical anchor coordinates through all symmetry operations to
+        # generate the full set of symmetrically-related coordinates
+        # (e.g., generating the full set of atomic positions from anchor sites in a crystal).
         rand_x = (batch.ops[:, :3, :3] @ rand_x_anchor.unsqueeze(-1)).squeeze(-1)
-        input_frac_coords = (frac_coords + sigmas_per_atom * rand_x) % 1.
 
+        # Adding noise to the fractional coordinates to create the noised samples.
+        input_frac_coords = (
+                                        frac_coords + sigmas_per_atom * rand_x) % 1.  # ensure the coordinates are wrapped within the unit cell.
 
+        # The crystal family converts the lattice matrix to a vector representation
         ori_crys_fam = self.crystal_family.m2v(lattices)
+        # I think this adds some constraints to the lattice vectors on what can be freely changed?
         ori_crys_fam = self.crystal_family.proj_k_to_spacegroup(ori_crys_fam, batch.spacegroup)
+
+        # The following four lines corresponds to the noise process for the lattice vectors as in the original DDPM paper.
         rand_crys_fam = torch.randn_like(ori_crys_fam)
         rand_crys_fam = self.crystal_family.proj_k_to_spacegroup(rand_crys_fam, batch.spacegroup)
         input_crys_fam = c0[:, None] * ori_crys_fam + c1[:, None] * rand_crys_fam
         input_crys_fam = self.crystal_family.proj_k_to_spacegroup(input_crys_fam, batch.spacegroup)
 
-        pred_crys_fam, pred_x = self.decoder(time_emb, batch.atom_types, input_frac_coords, input_crys_fam, batch.num_atoms, batch.batch)
+        # this is basically the reverse process in the diffusion model, which try to predict the original
+        # crystal from the noised crystal and the noised fractional coordinates.
+        pred_crys_fam, pred_x = self.decoder(time_emb, batch.atom_types, input_frac_coords, input_crys_fam,
+                                             batch.num_atoms, batch.batch)
         pred_crys_fam = self.crystal_family.proj_k_to_spacegroup(pred_crys_fam, batch.spacegroup)
-     
 
+        # This line transforms each predicted atomic coordinate into the anchor/canonical frame by applying the
+        # corresponding inverse symmetry operation, which is essential for comparing or aggregating coordinates
+        # in symmetry-aware crystal generation tasks.
         pred_x_proj = torch.einsum('bij, bj-> bi', batch.ops_inv, pred_x)
 
-        tar_x_anchor = d_log_p_wrapped_normal(sigmas_per_atom * rand_x_anchor, sigmas_per_atom) / torch.sqrt(sigmas_norm_per_atom)
+        # This line computes a normalized "score" (gradient of the log-probability) for the fractional coordinates of anchor atoms,
+        # using a wrapped normal distribution appropriate for periodic variables, and properly adjusts for the per-atom noise level
+        # at the current diffusion step. It is crucial for accurately modeling the noise and its effect on periodic coordinates in a diffusion process.
+        tar_x_anchor = d_log_p_wrapped_normal(sigmas_per_atom * rand_x_anchor, sigmas_per_atom) / torch.sqrt(
+            sigmas_norm_per_atom)
 
+        # Loss function computations:
         loss_lattice = F.mse_loss(pred_crys_fam, rand_crys_fam)
 
         loss_coord = F.mse_loss(pred_x_proj, tar_x_anchor)
 
         loss = (
-            self.hparams.cost_lattice * loss_lattice +
-            self.hparams.cost_coord * loss_coord)
-        
-        
+                self.hparams.cost_lattice * loss_lattice +
+                self.hparams.cost_coord * loss_coord)
 
         return {
-            'loss' : loss,
-            'loss_lattice' : loss_lattice,
-            'loss_coord' : loss_coord
+            'loss': loss,
+            'loss_lattice': loss_lattice,
+            'loss_coord': loss_coord
         }
 
     @torch.no_grad()
-    def sample(self, batch, diff_ratio = 1.0, step_lr = 1e-5):
-
+    def sample(self, batch, diff_ratio=1.0, step_lr=1e-5):
 
         batch_size = batch.num_graphs
 
         x_T = torch.rand([batch.num_nodes, 3]).to(self.device)
         crys_fam_T = torch.randn([batch_size, 6]).to(self.device)
         crys_fam_T = self.crystal_family.proj_k_to_spacegroup(crys_fam_T, batch.spacegroup)
-
 
         if diff_ratio < 1:
             time_start = int(self.beta_scheduler.timesteps * diff_ratio)
@@ -183,30 +232,28 @@ class CSPDiffusion(BaseModule):
 
         l_T = self.crystal_family.v2m(crys_fam_T)
 
-        x_T_all = torch.cat([x_T[batch.anchor_index], torch.ones(batch.ops.size(0),1).to(x_T.device)], dim=-1).unsqueeze(-1) # N * 4 * 1
+        x_T_all = torch.cat([x_T[batch.anchor_index], torch.ones(batch.ops.size(0), 1).to(x_T.device)],
+                            dim=-1).unsqueeze(-1)  # N * 4 * 1
 
-        x_T = (batch.ops @ x_T_all).squeeze(-1)[:,:3] % 1. # N * 3
+        x_T = (batch.ops @ x_T_all).squeeze(-1)[:, :3] % 1.  # N * 3
 
-        traj = {time_start : {
-            'num_atoms' : batch.num_atoms,
-            'atom_types' : batch.atom_types,
-            'frac_coords' : x_T % 1.,
-            'lattices' : l_T,
+        traj = {time_start: {
+            'num_atoms': batch.num_atoms,
+            'atom_types': batch.atom_types,
+            'frac_coords': x_T % 1.,
+            'lattices': l_T,
             'crys_fam': crys_fam_T
         }}
 
-
         for t in tqdm(range(time_start, 0, -1)):
-
-            times = torch.full((batch_size, ), t, device = self.device)
+            times = torch.full((batch_size,), t, device=self.device)
 
             time_emb = self.time_embedding(times)
 
-            
             alphas = self.beta_scheduler.alphas[t]
             alphas_cumprod = self.beta_scheduler.alphas_cumprod[t]
 
-            alphas_cumprod_next = self.beta_scheduler.alphas_cumprod[t-1]
+            alphas_cumprod_next = self.beta_scheduler.alphas_cumprod[t - 1]
 
             alphas_cumprod_next = torch.sqrt(alphas_cumprod_next)
 
@@ -214,10 +261,8 @@ class CSPDiffusion(BaseModule):
             sigma_x = self.sigma_scheduler.sigmas[t]
             sigma_norm = self.sigma_scheduler.sigmas_norm[t]
 
-
             c0 = 1.0 / torch.sqrt(alphas)
             c1 = (1 - alphas) / torch.sqrt(1 - alphas_cumprod)
-
 
             x_t = traj[t]['frac_coords']
             l_t = traj[t]['lattices']
@@ -234,22 +279,25 @@ class CSPDiffusion(BaseModule):
             rand_x_anchor = (batch.ops_inv[batch.anchor_index] @ rand_x_anchor.unsqueeze(-1)).squeeze(-1)
             rand_x = (batch.ops[:, :3, :3] @ rand_x_anchor.unsqueeze(-1)).squeeze(-1)
 
-            pred_crys_fam, pred_x = self.decoder(time_emb, batch.atom_types, x_t, crys_fam_t, batch.num_atoms, batch.batch)
+            pred_crys_fam, pred_x = self.decoder(time_emb, batch.atom_types, x_t, crys_fam_t, batch.num_atoms,
+                                                 batch.batch)
 
             pred_x = pred_x * torch.sqrt(sigma_norm)
 
             pred_x_proj = torch.einsum('bij, bj-> bi', batch.ops_inv, pred_x)
-            pred_x_anchor = scatter(pred_x_proj, batch.anchor_index, dim=0, reduce = 'mean')[batch.anchor_index]
+            pred_x_anchor = scatter(pred_x_proj, batch.anchor_index, dim=0, reduce='mean')[batch.anchor_index]
 
-            pred_x = (batch.ops[:, :3, :3] @ pred_x_anchor.unsqueeze(-1)).squeeze(-1) 
+            pred_x = (batch.ops[:, :3, :3] @ pred_x_anchor.unsqueeze(-1)).squeeze(-1)
 
             x_t_minus_05 = x_t - step_size * pred_x + std_x * rand_x
 
             crys_fam_t_minus_05 = crys_fam_t
 
-            frac_coords_all = torch.cat([x_t_minus_05[batch.anchor_index], torch.ones(batch.ops.size(0),1).to(x_t_minus_05.device)], dim=-1).unsqueeze(-1) # N * 4 * 1
+            frac_coords_all = torch.cat(
+                [x_t_minus_05[batch.anchor_index], torch.ones(batch.ops.size(0), 1).to(x_t_minus_05.device)],
+                dim=-1).unsqueeze(-1)  # N * 4 * 1
 
-            x_t_minus_05 = (batch.ops @ frac_coords_all).squeeze(-1)[:,:3] % 1. # N * 3
+            x_t_minus_05 = (batch.ops @ frac_coords_all).squeeze(-1)[:, :3] % 1.  # N * 3
 
             # Predictor
 
@@ -258,49 +306,49 @@ class CSPDiffusion(BaseModule):
             ori_crys_fam = crys_fam_t
             rand_x = torch.randn_like(x_T) if t > 1 else torch.zeros_like(x_T)
 
-            adjacent_sigma_x = self.sigma_scheduler.sigmas[t-1] 
+            adjacent_sigma_x = self.sigma_scheduler.sigmas[t - 1]
             step_size = (sigma_x ** 2 - adjacent_sigma_x ** 2)
-            std_x = torch.sqrt((adjacent_sigma_x ** 2 * (sigma_x ** 2 - adjacent_sigma_x ** 2)) / (sigma_x ** 2))   
+            std_x = torch.sqrt((adjacent_sigma_x ** 2 * (sigma_x ** 2 - adjacent_sigma_x ** 2)) / (sigma_x ** 2))
 
             rand_x_anchor = rand_x[batch.anchor_index]
             rand_x_anchor = (batch.ops_inv[batch.anchor_index] @ rand_x_anchor.unsqueeze(-1)).squeeze(-1)
             rand_x = (batch.ops[:, :3, :3] @ rand_x_anchor.unsqueeze(-1)).squeeze(-1)
 
-            pred_crys_fam, pred_x = self.decoder(time_emb, batch.atom_types, x_t_minus_05, crys_fam_t, batch.num_atoms, batch.batch)
+            pred_crys_fam, pred_x = self.decoder(time_emb, batch.atom_types, x_t_minus_05, crys_fam_t, batch.num_atoms,
+                                                 batch.batch)
 
             pred_x = pred_x * torch.sqrt(sigma_norm)
-            
+
             crys_fam_t_minus_1 = c0 * (ori_crys_fam - c1 * pred_crys_fam) + sigmas * rand_crys_fam
             crys_fam_t_minus_1 = self.crystal_family.proj_k_to_spacegroup(crys_fam_t_minus_1, batch.spacegroup)
 
             pred_x_proj = torch.einsum('bij, bj-> bi', batch.ops_inv, pred_x)
-            pred_x_anchor = scatter(pred_x_proj, batch.anchor_index, dim=0, reduce = 'mean')[batch.anchor_index]
-            pred_x = (batch.ops[:, :3, :3] @ pred_x_anchor.unsqueeze(-1)).squeeze(-1) 
+            pred_x_anchor = scatter(pred_x_proj, batch.anchor_index, dim=0, reduce='mean')[batch.anchor_index]
+            pred_x = (batch.ops[:, :3, :3] @ pred_x_anchor.unsqueeze(-1)).squeeze(-1)
 
             x_t_minus_1 = x_t_minus_05 - step_size * pred_x + std_x * rand_x
 
             l_t_minus_1 = self.crystal_family.v2m(crys_fam_t_minus_1)
 
+            frac_coords_all = torch.cat(
+                [x_t_minus_1[batch.anchor_index], torch.ones(batch.ops.size(0), 1).to(x_t_minus_1.device)],
+                dim=-1).unsqueeze(-1)  # N * 4 * 1
 
-            frac_coords_all = torch.cat([x_t_minus_1[batch.anchor_index], torch.ones(batch.ops.size(0),1).to(x_t_minus_1.device)], dim=-1).unsqueeze(-1) # N * 4 * 1
-
-            x_t_minus_1 = (batch.ops @ frac_coords_all).squeeze(-1)[:,:3] % 1. # N * 3
-
-
+            x_t_minus_1 = (batch.ops @ frac_coords_all).squeeze(-1)[:, :3] % 1.  # N * 3
 
             traj[t - 1] = {
-                'num_atoms' : batch.num_atoms,
-                'atom_types' : batch.atom_types,
-                'frac_coords' : x_t_minus_1 % 1.,
-                'lattices' : l_t_minus_1,
-                'crys_fam': crys_fam_t_minus_1              
+                'num_atoms': batch.num_atoms,
+                'atom_types': batch.atom_types,
+                'frac_coords': x_t_minus_1 % 1.,
+                'lattices': l_t_minus_1,
+                'crys_fam': crys_fam_t_minus_1
             }
 
         traj_stack = {
-            'num_atoms' : batch.num_atoms,
-            'atom_types' : batch.atom_types,
-            'all_frac_coords' : torch.stack([traj[i]['frac_coords'] for i in range(time_start, -1, -1)]),
-            'all_lattices' : torch.stack([traj[i]['lattices'] for i in range(time_start, -1, -1)])
+            'num_atoms': batch.num_atoms,
+            'atom_types': batch.atom_types,
+            'all_frac_coords': torch.stack([traj[i]['frac_coords'] for i in range(time_start, -1, -1)]),
+            'all_lattices': torch.stack([traj[i]['lattices'] for i in range(time_start, -1, -1)])
         }
 
         return traj[0], traj_stack
@@ -310,7 +358,7 @@ class CSPDiffusion(BaseModule):
         # If using mixed precision, the gradients are already unscaled here
 
         total_norm = 0.
-        for nm,p in self.decoder.named_parameters():
+        for nm, p in self.decoder.named_parameters():
             try:
                 param_norm = p.grad.data.norm(2)
                 total_norm = total_norm + param_norm.item() ** 2
@@ -319,8 +367,8 @@ class CSPDiffusion(BaseModule):
         total_norm = total_norm ** (1. / 2)
 
         self.log_dict({
-            'grad_norm':total_norm
-            },
+            'grad_norm': total_norm
+        },
             on_step=True,
             on_epoch=True,
             prog_bar=True,
@@ -334,11 +382,10 @@ class CSPDiffusion(BaseModule):
         loss_coord = output_dict['loss_coord']
         loss = output_dict['loss']
 
-
         self.log_dict(
             {'train_loss': loss,
-            'lattice_loss': loss_lattice,
-            'coord_loss': loss_coord},
+             'lattice_loss': loss_lattice,
+             'coord_loss': loss_coord},
             on_step=True,
             on_epoch=True,
             prog_bar=True,
@@ -349,8 +396,6 @@ class CSPDiffusion(BaseModule):
             return None
 
         return loss
-
-
 
     def validation_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
 
@@ -390,5 +435,3 @@ class CSPDiffusion(BaseModule):
         }
 
         return log_dict, loss
-
-    
